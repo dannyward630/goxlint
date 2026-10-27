@@ -8,7 +8,7 @@ Your linter gets its command line from `cli.Main`. This document uses the name
 | Command | Action |
 | --- | --- |
 | `goxlint [flags] [patterns]` | Lint the packages or files that the patterns select. |
-| `goxlint rules` | Show a table of all registered rules. |
+| `goxlint rules [flags]` | Show a table or JSON array of registered rules. |
 | `goxlint init` | Write `.goxlintrc.json` in the current directory. |
 | `goxlint -h` | Show the usage text. |
 
@@ -42,6 +42,20 @@ after the patterns.
 | `FIX` | The most dangerous fix level of the rule. Empty when the rule has no fixes. |
 | `TYPES` | `yes` when the rule needs type information. |
 | `DESCRIPTION` | The description from the rule metadata. |
+
+Use `--format json` to print an array with one object per rule, sorted by ID.
+The `enabled` value is the resolved base severity (`off`, `warn`, or `error`)
+from the nearest `.goxlintrc.json`, or from the default configuration when no
+file exists. Pass `-c path` to select a configuration file. File overrides are
+specific to the Go files being linted, so they do not change this base severity.
+
+Each object includes `id`, `plugin`, `name`, `description`, `category`, `scope`,
+`fixable`, `needsTypes`, `messages`, and `enabled`:
+
+```sh
+goxlint rules --format json
+goxlint rules --format json -c ./config/.goxlintrc.json
+```
 
 ### init
 

@@ -44,7 +44,7 @@ func Run(args []string, stdout, stderr io.Writer, plugins ...goxlint.Plugin) int
 	if len(args) > 0 {
 		switch args[0] {
 		case "rules":
-			return listRules(stdout, reg)
+			return listRulesCommand(args[1:], stdout, stderr, reg)
 		case "init":
 			return initConfig(stdout, stderr, reg)
 		}
@@ -263,13 +263,7 @@ func listRules(w io.Writer, reg *config.Registry) int {
 	fmt.Fprintln(tw, "RULE\tCATEGORY\tSCOPE\tFIX\tTYPES\tDESCRIPTION")
 	for _, id := range reg.IDs {
 		m := reg.Rules[id].Meta
-		scope := "file"
-		if reg.Rules[id].AnalyzePackage != nil {
-			scope = "package"
-			if reg.Rules[id].Create != nil {
-				scope = "file+package"
-			}
-		}
+		scope := ruleScope(reg.Rules[id])
 		types := ""
 		if m.NeedsTypes {
 			types = "yes"
@@ -283,6 +277,118 @@ func listRules(w io.Writer, reg *config.Registry) int {
 	tw.Flush()
 	fmt.Fprintf(w, "\n%d rules.\n", len(reg.IDs))
 	return 0
+}
+
+func listRulesCommand(args []string, stdout, stderr io.Writer, reg *config.Registry) int {
+	fs := flag.NewFlagSet("goxlint rules", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	format := fs.String("format", "table", "output format: table or json")
+	configPath := fs.String("c", "", "config file for resolved rule severity in JSON output")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: goxlint rules [--format table|json] [-c path]")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "goxlint rules: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(stderr, "goxlint rules: unknown format %q (use table or json)\n", *format)
+		return 2
+	}
+	if *format == "table" {
+		return listRules(stdout, reg)
+	}
+	resolved, err := resolveRulesConfig(*configPath, reg)
+	if err != nil {
+		fmt.Fprintln(stderr, "goxlint:", err)
+		return 2
+	}
+	return listRulesJSON(stdout, stderr, reg, resolved)
+}
+
+func resolveRulesConfig(configPath string, reg *config.Registry) (*config.Resolved, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	cfg, root := config.Default(), cwd
+	if configPath == "" {
+		configPath = config.Find(cwd)
+	}
+	if configPath != "" {
+		cfg, err = config.Load(configPath)
+		if err != nil {
+			return nil, err
+		}
+		abs, err := filepath.Abs(configPath)
+		if err != nil {
+			return nil, err
+		}
+		root = filepath.Dir(abs)
+	}
+	return config.Resolve(cfg, reg, root)
+}
+
+type ruleJSON struct {
+	ID          string            `json:"id"`
+	Plugin      string            `json:"plugin"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Category    goxlint.Category  `json:"category"`
+	Scope       string            `json:"scope"`
+	Fixable     string            `json:"fixable"`
+	NeedsTypes  bool              `json:"needsTypes"`
+	Messages    map[string]string `json:"messages"`
+	Enabled     string            `json:"enabled"`
+}
+
+func listRulesJSON(w, stderr io.Writer, reg *config.Registry, resolved *config.Resolved) int {
+	rules := make([]ruleJSON, 0, len(reg.IDs))
+	for _, id := range reg.IDs {
+		rule := reg.Rules[id]
+		plugin, name, _ := strings.Cut(id, "/")
+		messages := rule.Meta.Messages
+		if messages == nil {
+			messages = map[string]string{}
+		}
+		rules = append(rules, ruleJSON{
+			ID:          id,
+			Plugin:      plugin,
+			Name:        name,
+			Description: rule.Meta.Description,
+			Category:    rule.Meta.Category,
+			Scope:       ruleScope(rule),
+			Fixable:     rule.Meta.Fixable.String(),
+			NeedsTypes:  rule.Meta.NeedsTypes,
+			Messages:    messages,
+			Enabled:     resolved.Severity(id),
+		})
+	}
+
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(rules); err != nil {
+		fmt.Fprintln(stderr, "goxlint: write rules JSON:", err)
+		return 2
+	}
+	return 0
+}
+
+func ruleScope(rule *goxlint.Rule) string {
+	if rule.AnalyzePackage != nil {
+		if rule.Create != nil {
+			return "file+package"
+		}
+		return "package"
+	}
+	return "file"
 }
 
 func initConfig(stdout, stderr io.Writer, reg *config.Registry) int {

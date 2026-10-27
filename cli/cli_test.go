@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"go/ast"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/egoisutolabs/goxlint"
+	"github.com/egoisutolabs/goxlint/internal/config"
 )
 
 func writeTestFile(t *testing.T, name, source string) {
@@ -31,6 +33,124 @@ func testPlugin(typed bool) goxlint.Plugin {
 			}))
 		},
 	}}}
+}
+
+func rulesTestPlugin() goxlint.Plugin {
+	fileRule := func(*goxlint.Context) goxlint.Visitor { return nil }
+	packageRule := func(*goxlint.PackageContext) {}
+	return goxlint.Plugin{Name: "demo", Rules: []*goxlint.Rule{
+		{
+			Meta: goxlint.Meta{
+				Name: "zeta", Description: "Zeta rule.", Category: goxlint.Style,
+				Messages: map[string]string{"zeta": "Zeta message."},
+				Fixable:  goxlint.FixSuggestion, NeedsTypes: true,
+			},
+			AnalyzePackage: packageRule,
+		},
+		{
+			Meta: goxlint.Meta{
+				Name: "alpha", Description: "Alpha rule.", Category: goxlint.Correctness,
+				Messages: map[string]string{"alpha": "Alpha message."},
+			},
+			Create: fileRule,
+		},
+		{
+			Meta: goxlint.Meta{
+				Name: "both", Description: "Combined rule.", Category: goxlint.Restriction,
+				Fixable: goxlint.FixDangerous,
+			},
+			Create:         fileRule,
+			AnalyzePackage: packageRule,
+		},
+	}}
+}
+
+func TestRulesJSONUsesResolvedConfigAndMetadata(t *testing.T) {
+	t.Chdir(t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "custom.json")
+	writeTestFile(t, configPath, `{"categories":{"correctness":"warn","style":"error","restriction":"off"},"rules":{"demo/alpha":"error"}}`)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"rules", "--format", "json", "-c", configPath}, &stdout, &stderr, rulesTestPlugin()); code != 0 {
+		t.Fatalf("want success, got %d: %s", code, &stderr)
+	}
+	var got []struct {
+		ID          string            `json:"id"`
+		Plugin      string            `json:"plugin"`
+		Name        string            `json:"name"`
+		Description string            `json:"description"`
+		Category    goxlint.Category  `json:"category"`
+		Scope       string            `json:"scope"`
+		Fixable     string            `json:"fixable"`
+		NeedsTypes  bool              `json:"needsTypes"`
+		Messages    map[string]string `json:"messages"`
+		Enabled     string            `json:"enabled"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, &stdout)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want one object per rule, got %d: %s", len(got), &stdout)
+	}
+	if got[0].ID != "demo/alpha" || got[1].ID != "demo/both" || got[2].ID != "demo/zeta" {
+		t.Fatalf("rules are not sorted by ID: %#v", got)
+	}
+	if got[0].Plugin != "demo" || got[0].Name != "alpha" || got[0].Description != "Alpha rule." ||
+		got[0].Category != goxlint.Correctness || got[0].Scope != "file" || got[0].Fixable != "none" ||
+		got[0].NeedsTypes || got[0].Messages["alpha"] != "Alpha message." || got[0].Enabled != "error" {
+		t.Fatalf("unexpected alpha rule: %#v", got[0])
+	}
+	if got[1].Scope != "file+package" || got[1].Fixable != "dangerous" || got[1].Enabled != "off" {
+		t.Fatalf("unexpected both rule: %#v", got[1])
+	}
+	if got[2].Scope != "package" || got[2].Fixable != "suggestion" || !got[2].NeedsTypes || got[2].Enabled != "error" {
+		t.Fatalf("unexpected zeta rule: %#v", got[2])
+	}
+}
+
+func TestRulesJSONFindsNearestConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeTestFile(t, ".goxlintrc.json", `{"categories":{"style":"warn"}}`)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"rules", "--format=json"}, &stdout, &stderr, rulesTestPlugin()); code != 0 {
+		t.Fatalf("want success, got %d: %s", code, &stderr)
+	}
+	var got []struct {
+		ID      string `json:"id"`
+		Enabled string `json:"enabled"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	want := map[string]string{"demo/alpha": "off", "demo/both": "off", "demo/zeta": "warn"}
+	for _, rule := range got {
+		if want[rule.ID] != rule.Enabled {
+			t.Errorf("%s enabled=%q, want %q", rule.ID, rule.Enabled, want[rule.ID])
+		}
+	}
+}
+
+func TestRulesDefaultTableMatchesLegacyOutput(t *testing.T) {
+	plugin := rulesTestPlugin()
+	reg := config.NewRegistry(plugin)
+	var legacy, got, stderr bytes.Buffer
+	listRules(&legacy, reg)
+	if code := Run([]string{"rules"}, &got, &stderr, plugin); code != 0 {
+		t.Fatalf("want success, got %d: %s", code, &stderr)
+	}
+	if !bytes.Equal(got.Bytes(), legacy.Bytes()) {
+		t.Fatalf("default output changed:\nwant:\n%s\ngot:\n%s", &legacy, &got)
+	}
+}
+
+func TestRulesUnknownFormatExitsTwo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"rules", "--format", "yaml"}, &stdout, &stderr, rulesTestPlugin()); code != 2 {
+		t.Fatalf("want usage exit 2, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), `unknown format "yaml"`) {
+		t.Fatalf("missing unknown-format error: %s", &stderr)
+	}
 }
 
 func TestLoadErrorsFail(t *testing.T) {
@@ -274,7 +394,7 @@ func TestLoadErrorsStayInTheirPackage(t *testing.T) {
 			if got, _ := os.ReadFile("ok/a.go"); string(got) != "package ok\nvar good = 1\n" {
 				t.Fatalf("healthy package was not fixed: %q", got)
 			}
-			if !strings.Contains(stdout.String(), "ok/b.go:2:18: Unused suppression") {
+			if !strings.Contains(filepath.ToSlash(stdout.String()), "ok/b.go:2:18: Unused suppression") {
 				t.Fatalf("healthy package was not audited: %s", &stdout)
 			}
 			// Without types there are no imports to follow, so only typed mode

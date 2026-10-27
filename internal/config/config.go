@@ -279,6 +279,18 @@ func (r *Resolved) AllRules() []*goxlint.Rule {
 	return out
 }
 
+// Severity returns the resolved base severity for a rule, including off for
+// rules that are not enabled by the configuration. File overrides are applied
+// later by RulesFor because they depend on the file being linted.
+func (r *Resolved) Severity(id string) string {
+	for _, cr := range r.base {
+		if cr.ID == id {
+			return severityName(cr.Severity)
+		}
+	}
+	return "off"
+}
+
 // AnyOverrideNeedsTypes reports whether an override enables a rule needing types.
 func (r *Resolved) AnyOverrideNeedsTypes(reg *Registry) bool {
 	for _, o := range r.overrides {
