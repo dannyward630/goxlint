@@ -73,18 +73,7 @@ func TestRulesJSONUsesResolvedConfigAndMetadata(t *testing.T) {
 	if code := Run([]string{"rules", "--format", "json", "-c", configPath}, &stdout, &stderr, rulesTestPlugin()); code != 0 {
 		t.Fatalf("want success, got %d: %s", code, &stderr)
 	}
-	var got []struct {
-		ID          string            `json:"id"`
-		Plugin      string            `json:"plugin"`
-		Name        string            `json:"name"`
-		Description string            `json:"description"`
-		Category    goxlint.Category  `json:"category"`
-		Scope       string            `json:"scope"`
-		Fixable     string            `json:"fixable"`
-		NeedsTypes  bool              `json:"needsTypes"`
-		Messages    map[string]string `json:"messages"`
-		Enabled     string            `json:"enabled"`
-	}
+	var got []ruleJSON
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, &stdout)
 	}
@@ -115,10 +104,7 @@ func TestRulesJSONFindsNearestConfig(t *testing.T) {
 	if code := Run([]string{"rules", "--format=json"}, &stdout, &stderr, rulesTestPlugin()); code != 0 {
 		t.Fatalf("want success, got %d: %s", code, &stderr)
 	}
-	var got []struct {
-		ID      string `json:"id"`
-		Enabled string `json:"enabled"`
-	}
+	var got []ruleJSON
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
@@ -140,6 +126,20 @@ func TestRulesDefaultTableMatchesLegacyOutput(t *testing.T) {
 	}
 	if !bytes.Equal(got.Bytes(), legacy.Bytes()) {
 		t.Fatalf("default output changed:\nwant:\n%s\ngot:\n%s", &legacy, &got)
+	}
+}
+
+func TestRulesTableRejectsConfigFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	configPath := filepath.Join(t.TempDir(), "does-not-exist.json")
+	if code := Run([]string{"rules", "-c", configPath}, &stdout, &stderr, rulesTestPlugin()); code != 2 {
+		t.Fatalf("want usage exit 2, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "-c is only supported with --format json") {
+		t.Fatalf("missing config-format error: %s", &stderr)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("table output should be empty: %s", &stdout)
 	}
 }
 

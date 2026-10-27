@@ -43,11 +43,15 @@ after the patterns.
 | `TYPES` | `yes` when the rule needs type information. |
 | `DESCRIPTION` | The description from the rule metadata. |
 
-Use `--format json` to print an array with one object per rule, sorted by ID.
-The `enabled` value is the resolved base severity (`off`, `warn`, or `error`)
-from the nearest `.goxlintrc.json`, or from the default configuration when no
-file exists. Pass `-c path` to select a configuration file. File overrides are
-specific to the Go files being linted, so they do not change this base severity.
+Use `--format json` to show the rules as a JSON array. The array has one object
+for each rule. The objects are in rule ID order.
+
+The `enabled` value is the severity of the rule in the configuration: `off`,
+`warn`, or `error`. goxlint uses the nearest `.goxlintrc.json`. If there is no
+file, goxlint uses the default configuration. Use `-c path` to choose a
+configuration file. This flag works only with JSON output. The value does not
+include overrides, because an override applies only to the files that it
+selects.
 
 Each object includes `id`, `plugin`, `name`, `description`, `category`, `scope`,
 `fixable`, `needsTypes`, `messages`, and `enabled`:

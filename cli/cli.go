@@ -115,15 +115,9 @@ func lint(args []string, stdout, stderr io.Writer, reg *config.Registry) (int, e
 	if err != nil {
 		return 0, err
 	}
-	cfg, root := config.Default(), cwd
-	if *configPath == "" {
-		*configPath = config.Find(cwd)
-	}
-	if *configPath != "" {
-		if cfg, err = config.Load(*configPath); err != nil {
-			return 0, err
-		}
-		root = filepath.Dir(must(filepath.Abs(*configPath)))
+	cfg, root, err := loadConfig(*configPath, cwd)
+	if err != nil {
+		return 0, err
 	}
 	if err := applySeverityFlags(cfg, overrides); err != nil {
 		return 0, err
@@ -303,6 +297,16 @@ func listRulesCommand(args []string, stdout, stderr io.Writer, reg *config.Regis
 		return 2
 	}
 	if *format == "table" {
+		configFlagSet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "c" {
+				configFlagSet = true
+			}
+		})
+		if configFlagSet {
+			fmt.Fprintln(stderr, "goxlint rules: -c is only supported with --format json")
+			return 2
+		}
 		return listRules(stdout, reg)
 	}
 	resolved, err := resolveRulesConfig(*configPath, reg)
@@ -318,22 +322,31 @@ func resolveRulesConfig(configPath string, reg *config.Registry) (*config.Resolv
 	if err != nil {
 		return nil, err
 	}
+	cfg, root, err := loadConfig(configPath, cwd)
+	if err != nil {
+		return nil, err
+	}
+	return config.Resolve(cfg, reg, root)
+}
+
+func loadConfig(configPath, cwd string) (*config.Config, string, error) {
 	cfg, root := config.Default(), cwd
 	if configPath == "" {
 		configPath = config.Find(cwd)
 	}
 	if configPath != "" {
+		var err error
 		cfg, err = config.Load(configPath)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		abs, err := filepath.Abs(configPath)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		root = filepath.Dir(abs)
 	}
-	return config.Resolve(cfg, reg, root)
+	return cfg, root, nil
 }
 
 type ruleJSON struct {
