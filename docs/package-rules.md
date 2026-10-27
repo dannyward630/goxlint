@@ -164,8 +164,9 @@ goxlint keeps the file-rule diagnostics.
 
 ## Test a package rule
 
-`goxlinttest` does not run package rules. Read
-[Testing rules](testing-rules.md#package-rules).
+Use `goxlinttest.RunPackage` to test a package rule with several source files.
+It runs both rule phases and supports per-file options and disabled files.
+Read [Testing rules](testing-rules.md#package-rules).
 
 ## Example
 

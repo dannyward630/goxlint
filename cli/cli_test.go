@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"os"
 	"path/filepath"
@@ -403,5 +404,202 @@ func TestLoadErrorsStayInTheirPackage(t *testing.T) {
 				t.Fatalf("fixed a file importing a broken package: %q", got)
 			}
 		})
+	}
+}
+
+func unparenRule(kind goxlint.FixKind) *goxlint.Rule {
+	return &goxlint.Rule{
+		Meta: goxlint.Meta{Name: "unparen", Category: goxlint.Correctness, Fixable: kind},
+		Create: func(ctx *goxlint.Context) goxlint.Visitor {
+			return goxlint.Visit(goxlint.On(func(expr *ast.ParenExpr) {
+				ctx.Report(goxlint.Diagnostic{Node: expr, Message: "remove parentheses", Fix: &goxlint.Fix{
+					Kind: kind, Edits: []goxlint.Edit{goxlint.ReplaceNode(expr, ctx.Text(expr.X))},
+				}})
+			}))
+		},
+	}
+}
+
+func TestOverlappingFixPasses(t *testing.T) {
+	for _, tc := range []struct {
+		flag  string
+		kind  goxlint.FixKind
+		fixed bool
+	}{
+		{"--fix", goxlint.FixSafe, true},
+		{"--fix-suggestions", goxlint.FixSuggestion, true},
+		{"--fix-dangerously", goxlint.FixDangerous, true},
+		{"--fix", goxlint.FixSuggestion, false},
+		{"--fix-suggestions", goxlint.FixDangerous, false},
+	} {
+		t.Run(tc.flag+"/"+tc.kind.String(), func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			writeTestFile(t, ".goxlintrc.json", `{"rules":{"test/unparen":"error"}}`)
+			const original = "package p\nvar value = ((1))\n"
+			writeTestFile(t, "example.go", original)
+			var stdout, stderr bytes.Buffer
+			code := Run([]string{tc.flag, "--format=json", "example.go"}, &stdout, &stderr,
+				goxlint.Plugin{Name: "test", Rules: []*goxlint.Rule{unparenRule(tc.kind)}})
+			wantSource := original
+			if tc.fixed {
+				wantSource = "package p\nvar value = 1\n"
+				if code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
+					t.Fatalf("want no remaining diagnostics, got exit %d: %s; %s", code, &stdout, &stderr)
+				}
+				if stderr.String() != "Applied 2 fix(es) in 2 pass(es).\n" {
+					t.Fatalf("unexpected fix summary: %s", &stderr)
+				}
+			} else if code != 1 || stderr.Len() != 0 || !strings.Contains(stdout.String(), "remove parentheses") {
+				t.Fatalf("fix level was not respected: exit %d: %s; %s", code, &stdout, &stderr)
+			}
+			got, err := os.ReadFile("example.go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != wantSource {
+				t.Fatalf("got source %q, want %q", got, wantSource)
+			}
+		})
+	}
+}
+
+func TestFixPassLimitBoundary(t *testing.T) {
+	for _, depth := range []int{0, 10, 11} {
+		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			writeTestFile(t, ".goxlintrc.json", `{"rules":{"test/unparen":"error"}}`)
+			writeTestFile(t, "example.go", "package p\nvar value = "+strings.Repeat("(", depth)+"1"+strings.Repeat(")", depth)+"\n")
+			var stdout, stderr bytes.Buffer
+			code := Run([]string{"--fix", "--format=json", "example.go"}, &stdout, &stderr,
+				goxlint.Plugin{Name: "test", Rules: []*goxlint.Rule{unparenRule(goxlint.FixSafe)}})
+			if depth > 10 {
+				if code != 1 || !strings.Contains(stderr.String(), "fixes did not stabilize after 10 passes") || !strings.Contains(stderr.String(), "example.go") {
+					t.Fatalf("missing pass-limit warning: exit %d: %s", code, &stderr)
+				}
+				if !strings.Contains(stdout.String(), "remove parentheses") {
+					t.Fatalf("missing final diagnostic: %s", &stdout)
+				}
+			} else if code != 0 || strings.TrimSpace(stdout.String()) != "[]" || strings.Contains(stderr.String(), "warning:") {
+				t.Fatalf("stable file reported a problem: exit %d: %s; %s", code, &stdout, &stderr)
+			}
+			if depth == 0 {
+				if stderr.Len() != 0 {
+					t.Fatalf("reported fixes for a clean file: %s", &stderr)
+				}
+			} else if !strings.HasPrefix(stderr.String(), "Applied 10 fix(es) in 10 pass(es).\n") || strings.Count(stderr.String(), "Applied ") != 1 {
+				t.Fatalf("unexpected fix summary: %s", &stderr)
+			}
+			remaining := max(0, depth-10)
+			want := "package p\nvar value = " + strings.Repeat("(", remaining) + "1" + strings.Repeat(")", remaining) + "\n"
+			if got, err := os.ReadFile("example.go"); err != nil || string(got) != want {
+				t.Fatalf("unexpected final source %q: %v", got, err)
+			}
+		})
+	}
+}
+
+func TestOscillatingFixesStop(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeTestFile(t, ".goxlintrc.json", `{"categories":{"correctness":"error"}}`)
+	originals := map[string]string{
+		"a.go": "package p\nfunc a(left int) int { return 1 }\n",
+		"b.go": "package p\nfunc b(left int) int { return 1 }\n",
+	}
+	for name, source := range originals {
+		writeTestFile(t, name, source)
+	}
+	writeTestFile(t, "stable.go", "package p\nvar bad = 1\n")
+	plugin := testPlugin(false)
+	for _, pair := range [][2]string{{"left", "right"}, {"right", "left"}} {
+		from, to := pair[0], pair[1]
+		plugin.Rules = append(plugin.Rules, &goxlint.Rule{
+			Meta: goxlint.Meta{Name: "swap-" + from, Category: goxlint.Correctness, Fixable: goxlint.FixSafe},
+			Create: func(ctx *goxlint.Context) goxlint.Visitor {
+				return goxlint.Visit(goxlint.On(func(id *ast.Ident) {
+					if id.Name == from {
+						ctx.Report(goxlint.Diagnostic{Node: id, Message: "replace " + from + " with " + to, Fix: &goxlint.Fix{
+							Kind: goxlint.FixSafe, Edits: []goxlint.Edit{goxlint.ReplaceNode(id, to)},
+						}})
+					}
+				}))
+			},
+		})
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"--fix", "--format=json", "."}, &stdout, &stderr, plugin)
+	if code != 1 || !strings.HasPrefix(stderr.String(), "Applied 21 fix(es) in 10 pass(es).\n") {
+		t.Fatalf("unexpected fix result: exit %d: %s", code, &stderr)
+	}
+	if strings.Count(stderr.String(), "warning:") != 1 || !strings.Contains(stderr.String(), "a.go") || !strings.Contains(stderr.String(), "b.go") || strings.Contains(stderr.String(), "stable.go") {
+		t.Fatalf("warning must name only unstable files: %s", &stderr)
+	}
+	var diags []struct{ Rule, File, Message string }
+	if err := json.Unmarshal(stdout.Bytes(), &diags); err != nil {
+		t.Fatal(err)
+	}
+	if len(diags) != 2 {
+		t.Fatalf("want two final diagnostics, got %s", &stdout)
+	}
+	for _, d := range diags {
+		if d.Rule != "test/swap-left" || d.Message != "replace left with right" {
+			t.Errorf("diagnostic does not match the final source: %+v", d)
+		}
+		if got, err := os.ReadFile(d.File); err != nil || string(got) != originals[d.File] {
+			t.Errorf("unexpected final source %q: %v", got, err)
+		}
+	}
+	if got, err := os.ReadFile("stable.go"); err != nil || string(got) != "package p\nvar good = 1\n" {
+		t.Fatalf("stable file was not fixed: %q: %v", got, err)
+	}
+}
+
+func TestFixPassSkipsNewlyIncompletePackages(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeTestFile(t, "go.mod", "module example.com/test\n\ngo 1.26.0\n")
+	writeTestFile(t, ".goxlintrc.json", `{"categories":{"correctness":"error"}}`)
+	for _, dir := range []string{"healthy", "broken"} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, "healthy/a.go", "package healthy\nvar value = ((1))\n")
+	writeTestFile(t, "broken/b.go", "package broken\nvar value = 1\n")
+	plugin := goxlint.Plugin{Name: "test", Rules: []*goxlint.Rule{
+		unparenRule(goxlint.FixSafe),
+		{Meta: goxlint.Meta{Name: "types", Category: goxlint.Correctness, NeedsTypes: true}},
+		{
+			Meta: goxlint.Meta{Name: "break", Category: goxlint.Correctness, Fixable: goxlint.FixDangerous},
+			Create: func(ctx *goxlint.Context) goxlint.Visitor {
+				if filepath.Base(ctx.Filename) != "b.go" {
+					return nil
+				}
+				return goxlint.Visit(goxlint.On(func(spec *ast.ValueSpec) {
+					value := spec.Values[0]
+					replacement := "missing"
+					if ctx.Text(value) == "missing" {
+						replacement = "0"
+					}
+					ctx.Report(goxlint.Diagnostic{Node: value, Message: "replace with " + replacement, Fix: &goxlint.Fix{
+						Kind: goxlint.FixDangerous, Edits: []goxlint.Edit{goxlint.ReplaceNode(value, replacement)},
+					}})
+				}))
+			},
+		},
+	}}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"--fix-dangerously", "--format=json", "./..."}, &stdout, &stderr, plugin)
+	if code != 2 || strings.Count(stderr.String(), "goxlint: load:") != 1 || !strings.HasPrefix(stderr.String(), "Applied 3 fix(es) in 2 pass(es).\n") {
+		t.Fatalf("unexpected fix/load result: exit %d: %s", code, &stderr)
+	}
+	if !strings.Contains(stdout.String(), "replace with 0") {
+		t.Fatalf("missing diagnostic after the package became incomplete: %s", &stdout)
+	}
+	for name, want := range map[string]string{
+		"healthy/a.go": "package healthy\nvar value = 1\n",
+		"broken/b.go":  "package broken\nvar value = missing\n",
+	} {
+		if got, err := os.ReadFile(name); err != nil || string(got) != want {
+			t.Errorf("%s: got %q, want %q: %v", name, got, want, err)
+		}
 	}
 }

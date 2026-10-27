@@ -15,17 +15,19 @@ Read the documents in this order if you are new to goxlint.
 6. [Fixes](fixes.md): attach fixes to reports, and apply them.
 7. [Suppressions](suppressions.md): disable a rule for one line or one file.
 8. [Package rules](package-rules.md): examine all files of a package together.
-9. [How goxlint works](how-goxlint-works.md): the internal order of operations.
+9. [go/analysis adapter](go-analysis.md): run rules with existing analysis drivers.
+10. [How goxlint works](how-goxlint-works.md): the internal order of operations.
 
 ## Packages
 
-goxlint has three public packages. Other packages are internal.
+goxlint has four public packages. Other packages are internal.
 
 | Package | Use |
 | --- | --- |
 | `github.com/egoisutolabs/goxlint` | The rule API. Rules import this package. |
 | `github.com/egoisutolabs/goxlint/cli` | The command runner. Your `main` package calls `cli.Main`. |
 | `github.com/egoisutolabs/goxlint/goxlinttest` | The rule test harness. |
+| `github.com/egoisutolabs/goxlint/goxlintanalysis` | The go/analysis adapter. |
 
 ## Terms
 

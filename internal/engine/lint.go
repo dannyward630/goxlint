@@ -60,6 +60,8 @@ type Diagnostic struct {
 // LintOptions controls engine diagnostics independently of plugin rules.
 // The zero value disables unused-suppression reporting for isolated rule tests.
 type LintOptions struct {
+	// SinglePackage treats all input files as one package, as in an analysis.Pass.
+	SinglePackage            bool
 	ReportUnusedSuppressions Severity
 }
 

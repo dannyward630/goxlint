@@ -68,15 +68,23 @@ not run `gofmt` after it applies fixes.
 3. goxlint applies each fix that is permitted by the flag. If an edit of a fix
    overlaps an edit that goxlint applied before, goxlint does not apply that fix.
    goxlint applies all edits of a fix, or no edits of it.
-4. goxlint writes the changed files.
-5. goxlint shows `Applied N fix(es).` on stderr.
-6. goxlint loads and lints the files again. It shows the diagnostics that remain.
+4. goxlint writes the changed files, then loads and lints the files again.
+5. goxlint repeats steps 2 to 4 until no fixes apply, or until it completes
+   ten passes that apply fixes. An overlapping fix can apply on a later pass.
+6. If fixes were applied, goxlint shows `Applied N fix(es) in P pass(es).` on
+   stderr. `N` is the total number of fixes. `P` counts passes that applied
+   at least one fix.
+7. After ten passes, goxlint checks whether more permitted fixes can apply.
+   If so, it prints a warning on stderr that names the files that did not
+   stabilize. It does not write an eleventh pass.
+8. goxlint shows the diagnostics from the final lint, after the last write.
 
-goxlint applies fixes one time in each run. A fix that goxlint did not apply
-because of an overlap can apply in the next run. Run the command again until
-no fixes apply.
+A pass-limit warning can mean that two rules undo each other's fixes. Examine
+the rules and their options before you run the command again. A file that
+stabilizes on pass ten does not produce this warning.
 
-goxlint does not apply fixes to files of a package that did not load correctly.
+On every pass, goxlint skips fixes for files of a package that did not load
+correctly. This also applies when an earlier fix causes a load error.
 Read [How goxlint works](how-goxlint-works.md#load-errors).
 
 ## Show fixes without applying them

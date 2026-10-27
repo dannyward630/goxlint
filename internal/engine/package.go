@@ -21,7 +21,7 @@ func LintAll(files []File, rulesFor func(filename string) []ConfiguredRule, opts
 		rules[i] = rulesFor(files[i].Filename)
 		out[i], fileOpts[i] = lintFile(files[i], rules[i], opts)
 	})
-	groups := packageGroups(files)
+	groups := packageGroups(files, opts.SinglePackage)
 	parallel(len(groups), func(i int) {
 		lintPackage(files, groups[i], rules, out, fileOpts)
 	})
@@ -31,12 +31,15 @@ func LintAll(files []File, rulesFor func(filename string) []ConfiguredRule, opts
 	return out
 }
 
-func packageGroups(files []File) [][]int {
+func packageGroups(files []File, singlePackage bool) [][]int {
 	type packageKey struct{ dir, name string }
 	byPackage := map[packageKey]int{}
 	var groups [][]int
 	for i, f := range files {
 		key := packageKey{filepath.Dir(f.Filename), f.AST.Name.Name}
+		if singlePackage {
+			key = packageKey{}
+		}
 		group, ok := byPackage[key]
 		if !ok {
 			group = len(groups)

@@ -1,0 +1,3 @@
+package fixes
+
+var good = 1 // want "avoid bad"

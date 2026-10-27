@@ -18,6 +18,7 @@
 // Code without a package clause is wrapped in "package p". Line numbers in
 // Errors are relative to Code as written. Every case is type-checked, so code
 // must compile, apart from unused variables and imports.
+// Use RunPackage to test several source files together as one package.
 package goxlinttest
 
 import (
@@ -28,6 +29,9 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"maps"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -65,13 +69,45 @@ type Error struct {
 	Column    int
 }
 
+// PackageCases are the package inputs for one rule.
+type PackageCases struct {
+	Valid   []PackageCase
+	Invalid []PackageCase
+}
+
+// PackageCase is one package test input. Files are type-checked together.
+type PackageCase struct {
+	Name string
+	// Files maps filenames to source. Code without a package clause gets package p.
+	Files map[string]string
+	// Options are encoded to JSON and applied to every file.
+	Options any
+	// FileOptions replaces Options for the named files. A literal nil disables
+	// the rule for that file, but keeps the file as package-analysis evidence.
+	// A typed nil pointer stays enabled and is encoded as JSON null.
+	//goxlint:ignore anti-slop/no-any-map-values JSON options accept user-defined structs or maps for each file
+	FileOptions map[string]any
+	// Errors are ordered by filename, then position. Invalid cases only.
+	Errors []PackageError
+}
+
+// PackageError is an expected package diagnostic. Zero fields are not checked.
+// Line is relative to the source in Files, before an added package clause.
+type PackageError struct {
+	Filename  string
+	MessageID string
+	Message   string
+	Line      int
+	Column    int
+}
+
 const ruleID = "test/rule"
 
 // Run tests rule against cases.
 func Run(t *testing.T, rule *goxlint.Rule, cases Cases) {
 	t.Helper()
 	for i, c := range cases.Valid {
-		t.Run(caseName("valid", i, c), func(t *testing.T) {
+		t.Run(caseName("valid", i, c.Name), func(t *testing.T) {
 			t.Helper()
 			res := lint(t, rule, c)
 			for _, d := range res.diags {
@@ -80,7 +116,7 @@ func Run(t *testing.T, rule *goxlint.Rule, cases Cases) {
 		})
 	}
 	for i, c := range cases.Invalid {
-		t.Run(caseName("invalid", i, c), func(t *testing.T) {
+		t.Run(caseName("invalid", i, c.Name), func(t *testing.T) {
 			t.Helper()
 			if len(c.Errors) == 0 {
 				t.Fatal("invalid case must list Errors")
@@ -92,9 +128,43 @@ func Run(t *testing.T, rule *goxlint.Rule, cases Cases) {
 	}
 }
 
-func caseName(kind string, i int, c Case) string {
-	if c.Name != "" {
-		return kind + "/" + c.Name
+// RunPackage tests file visitors and package analysis against multi-file cases.
+// Every case must contain at least one file. All files form one Go package,
+// even if their filenames contain different directories. Fixes are not checked.
+func RunPackage(t *testing.T, rule *goxlint.Rule, cases PackageCases) {
+	t.Helper()
+	for i, c := range cases.Valid {
+		t.Run(caseName("valid", i, c.Name), func(t *testing.T) {
+			t.Helper()
+			res := lintPackage(t, rule, c)
+			checkErrors(t, rule, res, nil)
+		})
+	}
+	for i, c := range cases.Invalid {
+		t.Run(caseName("invalid", i, c.Name), func(t *testing.T) {
+			t.Helper()
+			if len(c.Errors) == 0 {
+				t.Fatal("invalid case must list Errors")
+			}
+			res := lintPackage(t, rule, c)
+			want := make([]Error, len(c.Errors))
+			for i, w := range c.Errors {
+				want[i] = Error{MessageID: w.MessageID, Message: w.Message, Line: w.Line, Column: w.Column}
+			}
+			checkErrors(t, rule, res, want)
+			for i, w := range c.Errors {
+				got := res.diags[i].Filename
+				if w.Filename != "" && filepath.ToSlash(w.Filename) != filepath.ToSlash(got) {
+					t.Errorf("error %d: filename = %q, want %q", i, got, w.Filename)
+				}
+			}
+		})
+	}
+}
+
+func caseName(kind string, i int, name string) string {
+	if name != "" {
+		return kind + "/" + name
 	}
 	return fmt.Sprintf("%s/%d", kind, i)
 }
@@ -128,23 +198,99 @@ func lint(t *testing.T, rule *goxlint.Rule, c Case) result {
 		filename = "p.go"
 	}
 
-	var opts json.RawMessage
-	if c.Options != nil {
-		b, err := json.Marshal(c.Options)
-		if err != nil {
-			t.Fatalf("encoding options: %v", err)
-		}
-		opts = b
-	}
+	opts := encodeOptions(t, c.Options)
 
 	mu.Lock()
 	defer mu.Unlock()
-	if imp == nil {
-		imp = importer.ForCompiler(fset, "source", nil)
-	}
 	af, err := parser.ParseFile(fset, filename, src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
+	}
+	files := []engine.File{{Fset: fset, AST: af, Filename: filename, Source: src}}
+	typeCheck(t, files)
+	cr := engine.ConfiguredRule{ID: ruleID, Plugin: "test", Rule: rule, Severity: engine.Error, Options: opts}
+	diags := engine.LintFile(files[0], []engine.ConfiguredRule{cr}, engine.LintOptions{})
+	return result{diags: diags, src: src, prefix: prefix}
+}
+
+func lintPackage(t *testing.T, rule *goxlint.Rule, c PackageCase) result {
+	t.Helper()
+	if len(c.Files) == 0 {
+		t.Fatal("package case must contain Files")
+	}
+	for name := range c.FileOptions {
+		if _, ok := c.Files[name]; !ok {
+			t.Fatalf("FileOptions names unknown file %q", name)
+		}
+	}
+	options := encodeOptions(t, c.Options)
+	rules := make(map[string][]engine.ConfiguredRule, len(c.Files))
+	var files []engine.File
+	var prefixes []int
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range slices.Sorted(maps.Keys(c.Files)) {
+		if name == "" {
+			t.Fatal("package filename must not be empty")
+		}
+		code := c.Files[name]
+		prefix := ""
+		if !hasPackageClause(code) {
+			prefix = "package p\n\n"
+		}
+		src := []byte(prefix + code)
+		af, err := parser.ParseFile(fset, name, src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		files = append(files, engine.File{Fset: fset, AST: af, Filename: name, Source: src})
+		prefixes = append(prefixes, strings.Count(prefix, "\n"))
+		opts := options
+		if override, ok := c.FileOptions[name]; ok {
+			if override == nil {
+				continue
+			}
+			opts = encodeOptions(t, override)
+		}
+		rules[name] = []engine.ConfiguredRule{{ID: ruleID, Plugin: "test", Rule: rule, Severity: engine.Error, Options: opts}}
+	}
+	typeCheck(t, files)
+	var res result
+	for i, diags := range engine.LintAll(files, func(name string) []engine.ConfiguredRule {
+		return rules[name]
+	}, engine.LintOptions{SinglePackage: true}) {
+		for _, d := range diags {
+			d.Start.Line -= prefixes[i]
+			d.End.Line -= prefixes[i]
+			res.diags = append(res.diags, d)
+		}
+	}
+	return res
+}
+
+//goxlint:ignore anti-slop/no-any-parameters this JSON boundary immediately marshals user-defined option values
+func encodeOptions(t *testing.T, options any) json.RawMessage {
+	t.Helper()
+	if options == nil {
+		return nil
+	}
+	b, err := json.Marshal(options)
+	if err != nil {
+		t.Fatalf("encoding options: %v", err)
+	}
+	return b
+}
+
+// typeCheck shares the source importer with single-file cases. Caller holds mu.
+func typeCheck(t *testing.T, files []engine.File) {
+	t.Helper()
+	if imp == nil {
+		imp = importer.ForCompiler(fset, "source", nil)
+	}
+	var syntax []*ast.File
+	for _, file := range files {
+		syntax = append(syntax, file.AST)
 	}
 	info := &types.Info{
 		Types:        map[ast.Expr]types.TypeAndValue{},
@@ -164,14 +310,14 @@ func lint(t *testing.T, rule *goxlint.Rule, c Case) result {
 		t.Errorf("type error: %v", err)
 	}}
 	// Type errors were already reported through conf.Error.
-	pkg, _ := conf.Check(af.Name.Name, fset, []*ast.File{af}, info)
+	pkg, _ := conf.Check(syntax[0].Name.Name, fset, syntax, info)
 	if t.Failed() {
 		t.FailNow()
 	}
 
-	cr := engine.ConfiguredRule{ID: ruleID, Plugin: "test", Rule: rule, Severity: engine.Error, Options: opts}
-	diags := engine.LintFile(engine.File{Fset: fset, AST: af, Filename: filename, Source: src, Pkg: pkg, Info: info}, []engine.ConfiguredRule{cr}, engine.LintOptions{})
-	return result{diags: diags, src: src, prefix: prefix}
+	for i := range files {
+		files[i].Pkg, files[i].Info = pkg, info
+	}
 }
 
 func hasPackageClause(code string) bool {
@@ -195,7 +341,7 @@ func checkErrors(t *testing.T, rule *goxlint.Rule, res result, want []Error) {
 	if len(res.diags) != len(want) {
 		var got []string
 		for _, d := range res.diags {
-			got = append(got, fmt.Sprintf("  %d:%d %s", res.line(d), d.Start.Column, d.Message))
+			got = append(got, fmt.Sprintf("  %s:%d:%d %s", d.Filename, res.line(d), d.Start.Column, d.Message))
 		}
 		t.Fatalf("got %d diagnostics, want %d:\n%s", len(res.diags), len(want), strings.Join(got, "\n"))
 	}

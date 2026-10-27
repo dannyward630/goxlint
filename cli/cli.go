@@ -57,6 +57,8 @@ func Run(args []string, stdout, stderr io.Writer, plugins ...goxlint.Plugin) int
 	return code
 }
 
+const maxFixPasses = 10
+
 type severityFlag struct {
 	sev  string
 	list *[][2]string
@@ -159,25 +161,49 @@ func lint(args []string, stdout, stderr io.Writer, reg *config.Registry) (int, e
 	results := engine.LintAll(files, rulesFor, lintOpts)
 
 	if maxFix != goxlint.FixNone {
-		fixed := 0
-		for i, f := range files {
-			// An incomplete package may leave rules without the context needed for safe fixes.
-			if f.Incomplete {
-				continue
+		fixed, passes := 0, 0
+		for passes < maxFixPasses {
+			appliedInPass := 0
+			for i, f := range files {
+				// An incomplete package may leave rules without the context needed for safe fixes.
+				if f.Incomplete {
+					continue
+				}
+				src, applied := engine.ApplyFixes(f.Source, results[i], maxFix)
+				if len(applied) == 0 {
+					continue
+				}
+				if err := os.WriteFile(f.Filename, src, 0o644); err != nil {
+					return 0, err
+				}
+				appliedInPass += len(applied)
 			}
-			src, applied := engine.ApplyFixes(f.Source, results[i], maxFix)
-			if len(applied) == 0 {
-				continue
+			if appliedInPass == 0 {
+				break
 			}
-			if err := os.WriteFile(f.Filename, src, 0o644); err != nil {
-				return 0, err
-			}
-			fixed += len(applied)
-		}
-		if fixed > 0 {
-			fmt.Fprintf(stderr, "Applied %d fix(es).\n", fixed)
+			fixed += appliedInPass
+			passes++
 			files, loadErrs = engine.Load(opts)
 			results = engine.LintAll(files, rulesFor, lintOpts)
+		}
+		if fixed > 0 {
+			fmt.Fprintf(stderr, "Applied %d fix(es) in %d pass(es).\n", fixed, passes)
+		}
+		if passes == maxFixPasses {
+			// Check the final diagnostics without writing an eleventh pass.
+			var unstable []string
+			for i, f := range files {
+				if f.Incomplete {
+					continue
+				}
+				if _, applied := engine.ApplyFixes(f.Source, results[i], maxFix); len(applied) > 0 {
+					unstable = append(unstable, f.Filename)
+				}
+			}
+			if len(unstable) > 0 {
+				slices.Sort(unstable)
+				fmt.Fprintf(stderr, "goxlint: warning: fixes did not stabilize after %d passes in files: %q\n", passes, unstable)
+			}
 		}
 	}
 

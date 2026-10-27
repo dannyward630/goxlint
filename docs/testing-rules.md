@@ -1,7 +1,7 @@
 # Testing rules
 
-The `goxlinttest` package tests a file rule with code samples. It has the same
-function as the ESLint and oxlint `RuleTester`.
+The `goxlinttest` package tests file and package rules with code samples. It has
+the same function as the ESLint and oxlint `RuleTester`.
 
 ## A test
 
@@ -121,10 +121,83 @@ Set `Filename` to a name that ends with `_test.go`:
 
 ## Package rules
 
-`goxlinttest` tests file rules only. It does not run `AnalyzePackage`. Test a
-package rule with a Go test that loads a small package and examines the
-diagnostics. The example plugin `examples/goxlint/plugins/maintainability` has a
-test of this type.
+Use `goxlinttest.RunPackage` for a case with more than one file. It runs both
+`Create` and `AnalyzePackage`. All files form one package, even when their
+names contain different directories.
+
+This example tests `LargePackage` from [Package rules](package-rules.md):
+
+```go
+package rules
+
+import (
+	"testing"
+
+	"github.com/egoisutolabs/goxlint/goxlinttest"
+)
+
+func TestLargePackage(t *testing.T) {
+	goxlinttest.RunPackage(t, LargePackage, goxlinttest.PackageCases{
+		Valid: []goxlinttest.PackageCase{
+			{
+				Name:    "within limit",
+				Files:   map[string]string{"a.go": "package p"},
+				Options: map[string]int{"maxFiles": 1},
+			},
+		},
+		Invalid: []goxlinttest.PackageCase{
+			{
+				Name: "disabled file still counts",
+				Files: map[string]string{
+					"a.go": "package p",
+					"b.go": "package p",
+				},
+				Options:     map[string]int{"maxFiles": 1},
+				FileOptions: map[string]any{"b.go": nil},
+				Errors: []goxlinttest.PackageError{
+					{Filename: "a.go", MessageID: "large", Line: 1, Column: 9},
+				},
+			},
+		},
+	})
+}
+```
+
+`RunPackage` takes a `PackageCases` struct with `Valid` and `Invalid` lists,
+like `Run` takes `Cases`. It uses the same subtest names as `Run`. Each
+`PackageCase` has these fields:
+
+| Field | Description |
+| --- | --- |
+| `Name` | Optional. The subtest name. |
+| `Files` | A map from filename to Go source. Supply at least one file. Filenames must not be empty. |
+| `Options` | Optional. The rule options for all files. |
+| `FileOptions` | Optional. Options that replace `Options` for named files. Each key must name a file in `Files`. A `nil` value disables the rule for that file. |
+| `Errors` | Invalid cases only. Expected diagnostics, ordered by filename, then line and column. |
+
+A disabled file stays in `PackageContext.Files` with `Enabled == false`. Its
+source still participates in type-checking. File visitors do not run for that
+file, and reports from its context are ignored. A disabled file has no rule
+options. If all files are disabled, neither rule phase runs.
+
+Use a literal `nil` in `FileOptions` to disable a file. A typed nil pointer,
+such as `(*Opts)(nil)`, stays enabled and is encoded as JSON `null`.
+
+Each `PackageError` has the fields of `Error`, plus `Filename`. Fields with a
+zero value are not checked. Lines are relative to each source string in
+`Files`. If a file has no package clause, the harness adds `package p` and
+adjusts diagnostic lines, as `Run` does. All files must have the same package
+name. The harness type-checks them together. Unused variables and imports are
+permitted. Type information reaches the rule only if it has `NeedsTypes`.
+
+Use `test/rule` in suppression comments. Suppressions apply to diagnostics from
+both rule phases. The harness does not report unused suppressions. An internal
+rule error fails the test and shows the error message, even if it matches an
+expected error.
+
+`RunPackage` does not check fix output. It does not load packages from disk or
+apply build tags. It does not create Go test variants. Put a `_test.go` file in
+`Files` to test filename-based rule behavior.
 
 ## Recommendations
 
